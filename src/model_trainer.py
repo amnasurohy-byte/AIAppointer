@@ -18,69 +18,47 @@ class ModelTrainer:
             os.makedirs(models_dir)
             
         self.encoders = {}
-        self.target_encoder = None
-        self.model = None
+        self.role_encoder = None
+        self.unit_encoder = None
+        self.role_model = None
+        self.unit_model = None
         self.feature_cols = []
 
     def train(self, csv_path):
         print("="*60)
-        print("STEP 1: Generating Role Constraints (Based on Generalized Roles)")
+        print("STEP 1: Generating Role Constraints")
         print("="*60)
         from src.constraint_generator import generate_constraints
         generate_constraints(csv_path, output_dir=self.models_dir, verbose=True)
         
         print("\n" + "="*60)
-        print("STEP 2: Loading and Processing Data")
+        print("STEP 2: Processing Data")
         print("="*60)
-        print(f"Loading data from {csv_path}...")
         df = pd.read_csv(csv_path)
-        
-        # 1. Processing Pipeline
-        print("Running Data Pipeline (Transition Mode)...")
         dp = DataProcessor()
-        # Create Transition Dataset (Exploded)
         df_transitions = dp.create_transition_dataset(df)
-        print(f"Dataset exploded from {len(df)} officers to {len(df_transitions)} transitions.")
         
         fe = FeatureEngineer()
         df_transitions = fe.extract_features(df_transitions)
         
-        # --- NEW: Save Knowledge Base for CBR (Specificity) ---
-        print("Saving Knowledge Base for Specificity Ranking...")
-        # We need: Rank, Branch, last_role_title, Target_Next_Role (Gen), Target_Next_Role_Raw
+        # Save KB
         kb_cols = ['Rank', 'Branch', 'last_role_title', 'Target_Next_Role', 'Target_Next_Role_Raw']
-
-        # Ensure 'last_role_title' is populated (it was by extract_features)
-        # We save this as a lightweight CSV or Parquet
         kb_df = df_transitions[kb_cols].copy()
         kb_df.to_csv(os.path.join(self.models_dir, 'knowledge_base.csv'), index=False)
-        print(f"Saved {len(kb_df)} case examples to knowledge_base.csv")
-        # -----------------------------------------------------------
 
-        # 2. Prepare Features (X) and Target (y)
+        # Features
         cat_features = ['Rank', 'Branch', 'Pool', 'Entry_type',
                         'last_role_title', 'prev_role_2', 'prev_role_3', 'last_training_title']
-
         num_features = ['years_service', 'days_in_last_role', 'years_in_current_rank', 'num_prior_roles', 
                         'num_training_courses', 
                         'count_command_training', 'count_tactical_training', 'count_science_training',
                         'count_engineering_training', 'count_medical_training',
                         'days_since_last_training']
         
-        target_col = 'Target_Next_Role' # Now this is the NORMALIZED role
-        
         X = df_transitions[cat_features + num_features].copy()
-        y = df_transitions[target_col].copy()
+        self.feature_cols = cat_features + num_features
         
-        # Filter out classes with < 2 samples
-        class_counts = y.value_counts()
-        valid_classes = class_counts[class_counts >= 2].index
-        mask = y.isin(valid_classes)
-        print(f"Dropping {len(y) - mask.sum()} rows due to rare target classes (freq < 2).")
-        X = X[mask]
-        y = y[mask]
-
-        # 3. Encoding
+        # Encoding Features
         print("Encoding Features...")
         for col in cat_features:
             le = LabelEncoder()
@@ -88,66 +66,79 @@ class ModelTrainer:
             X[col] = le.fit_transform(X[col])
             self.encoders[col] = le
             
-        # Encode Target
-        print("Encoding Target...")
-        self.target_encoder = LabelEncoder()
-        y = self.target_encoder.fit_transform(y.astype(str))
-        
-        self.feature_cols = cat_features + num_features
-        
-        # 4. Split (Stratified)
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
-        )
-        
-        # 5. Train LightGBM
-        print(f"Training LightGBM on {len(X_train)} samples...")
-        cat_indices = [X.columns.get_loc(c) for c in cat_features]
-        
-        self.model = lgb.LGBMClassifier(
+        # --- MODEL A: ROLE PREDICTION ---
+        print("\n" + "="*40)
+        print("TRAINING MODEL A: Generalized Role")
+        print("="*40)
+        y_role = df_transitions['Target_Next_Role'].copy()
+
+        # Filter Rare Roles
+        role_counts = y_role.value_counts()
+        valid_roles = role_counts[role_counts >= 2].index
+        mask_role = y_role.isin(valid_roles)
+        X_role = X[mask_role]
+        y_role_filtered = y_role[mask_role]
+
+        self.role_encoder = LabelEncoder()
+        y_role_enc = self.role_encoder.fit_transform(y_role_filtered.astype(str))
+
+        # Split
+        X_train, X_test, y_train, y_test = train_test_split(X_role, y_role_enc, test_size=0.2, random_state=42, stratify=y_role_enc)
+
+        self.role_model = lgb.LGBMClassifier(
             objective='multiclass',
-            num_class=len(self.target_encoder.classes_),
+            num_class=len(self.role_encoder.classes_),
             n_estimators=50,
             learning_rate=0.05,
             random_state=42,
             n_jobs=-1
         )
+        cat_indices = [X.columns.get_loc(c) for c in cat_features]
+        self.role_model.fit(X_train, y_train, categorical_feature=cat_indices)
         
-        self.model.fit(
-            X_train, y_train,
-            eval_set=[(X_test, y_test)],
-            eval_metric='multi_logloss',
-            categorical_feature=cat_indices
+        print(f"Role Top-1 Acc: {accuracy_score(y_test, self.role_model.predict(X_test)):.3f}")
+        
+        # --- MODEL B: UNIT PREDICTION ---
+        print("\n" + "="*40)
+        print("TRAINING MODEL B: Target Unit")
+        print("="*40)
+        y_unit = df_transitions['Target_Next_Unit'].copy()
+        self.unit_encoder = LabelEncoder()
+        y_unit_enc = self.unit_encoder.fit_transform(y_unit.astype(str))
+        
+        # Split (Stratified on Units)
+        # Note: Some units are rare, StratifiedKFold might warn, but train_test_split handles singletons by putting in train usually?
+        # Or we filter.
+        valid_units = y_unit.value_counts()[y_unit.value_counts() >= 2].index
+        mask_unit = y_unit.isin(valid_units)
+        X_unit = X[mask_unit]
+        y_unit_enc_filtered = self.unit_encoder.transform(y_unit[mask_unit].astype(str))
+        
+        X_train_u, X_test_u, y_train_u, y_test_u = train_test_split(X_unit, y_unit_enc_filtered, test_size=0.2, random_state=42, stratify=y_unit_enc_filtered)
+        
+        self.unit_model = lgb.LGBMClassifier(
+            objective='multiclass',
+            num_class=len(self.unit_encoder.classes_),
+            n_estimators=50,
+            learning_rate=0.05,
+            random_state=42,
+            n_jobs=-1
         )
-        
-        # 6. Evaluate
-        print("Evaluating...")
-        y_pred = self.model.predict(X_test)
-        acc = accuracy_score(y_test, y_pred)
-        print(f"Top-1 Accuracy: {acc:.4f}")
-        
-        probas = self.model.predict_proba(X_test)
-        top5_acc = self._top_k_accuracy(y_test, probas, k=5)
-        print(f"Top-5 Accuracy: {top5_acc:.4f}")
-        
-        # 7. Save Artifacts
+        self.unit_model.fit(X_train_u, y_train_u, categorical_feature=cat_indices)
+
+        print(f"Unit Top-1 Acc: {accuracy_score(y_test_u, self.unit_model.predict(X_test_u)):.3f}")
+
         self.save_artifacts()
-        
-    def _top_k_accuracy(self, y_true, y_proba, k=5):
-        # Setup
-        best_n = np.argsort(y_proba, axis=1)[:,-k:]
-        ts = 0
-        for i in range(len(y_true)):
-            if y_true[i] in best_n[i,:]:
-                ts += 1
-        return ts / len(y_true)
 
     def save_artifacts(self):
-        print(f"Saving model and encoders to {self.models_dir}...")
-        joblib.dump(self.model, os.path.join(self.models_dir, 'lgbm_model.pkl'))
-        joblib.dump(self.encoders, os.path.join(self.models_dir, 'feature_encoders.pkl'))
-        joblib.dump(self.target_encoder, os.path.join(self.models_dir, 'target_encoder.pkl'))
-        joblib.dump(self.feature_cols, os.path.join(self.models_dir, 'feature_cols.pkl'))
+        print(f"Saving models to {self.models_dir}...")
+        # Compress
+        joblib.dump(self.role_model, os.path.join(self.models_dir, 'role_model.pkl'), compress=3)
+        joblib.dump(self.unit_model, os.path.join(self.models_dir, 'unit_model.pkl'), compress=3)
+        joblib.dump(self.encoders, os.path.join(self.models_dir, 'feature_encoders.pkl'), compress=3)
+        joblib.dump(self.role_encoder, os.path.join(self.models_dir, 'role_encoder.pkl'), compress=3)
+        joblib.dump(self.unit_encoder, os.path.join(self.models_dir, 'unit_encoder.pkl'), compress=3)
+        joblib.dump(self.feature_cols, os.path.join(self.models_dir, 'feature_cols.pkl'), compress=3)
         print("Save Complete.")
 
 if __name__ == "__main__":

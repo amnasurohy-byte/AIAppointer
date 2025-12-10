@@ -37,7 +37,7 @@ class DataProcessor:
         splitters = [
             'Starbase', 'Dockyard', 'Field HQ', 'Fleet', 'Systems Maintenance',
             'USS', 'SS', 'RS', 'CS', 'ISS',
-            'Starfleet', 'Advanced', 'Enlisted', 'Systems Design', 'Warp' # Added specific academy prefixes often found
+            'Starfleet', 'Advanced', 'Enlisted', 'Systems Design', 'Warp'
         ]
 
         for splitter in splitters:
@@ -46,6 +46,43 @@ class DataProcessor:
                 break
 
         return role.strip()
+
+    def extract_unit(self, role):
+        """
+        Extracts the 'Unit' from a specific role title.
+        E.g., "Div Officer USS Vanguard" -> "USS Vanguard"
+        """
+        if pd.isna(role): return "Unknown"
+        role = str(role)
+
+        # Prefixes that denote a unit
+        prefixes = ['USS', 'SS', 'RS', 'CS', 'ISS', 'Starbase', 'Dockyard', 'Field HQ']
+
+        for p in prefixes:
+            if p in role:
+                # Regex to grab "Prefix Name" (e.g., "USS Vanguard")
+                # We assume the unit name ends at the end of string or before " /"
+                # Remove " / Post X" first
+                clean_role = re.sub(r'\s*/\s*Post\s*\d+.*', '', role, flags=re.IGNORECASE).strip()
+
+                # Split by prefix
+                parts = clean_role.split(p)
+                if len(parts) > 1:
+                    suffix = parts[1].strip()
+                    # Take first word of suffix? Or entire suffix?
+                    # "USS Vanguard" -> suffix="Vanguard"
+                    # "Starbase 12" -> suffix="12"
+                    # "Dockyard Complex One" -> suffix="Complex One"
+                    return f"{p} {suffix}".strip()
+
+        # Special cases
+        if "Wing" in role:
+             clean_role = re.sub(r'\s*/\s*Post\s*\d+.*', '', role, flags=re.IGNORECASE).strip()
+             parts = clean_role.split("Wing")
+             if len(parts) > 1:
+                  return f"Wing {parts[1].strip()}"
+
+        return "Generic"
 
     def parse_history_column(self, text):
         """
@@ -148,6 +185,9 @@ class DataProcessor:
                      rank_at_time = self.get_rank_at_date(row['parsed_promotions'], decision_date)
                 else:
                     rank_at_time = row['Rank']
+
+                # Extract Unit for Target
+                target_unit = self.extract_unit(role_next['title'])
                 
                 transition_row = {
                     'Employee_ID': emp_id,
@@ -155,8 +195,9 @@ class DataProcessor:
                     'Pool': static_pool,
                     'Entry_type': row['Entry_type'],
                     'Rank': rank_at_time,
-                    'Target_Next_Role_Raw': role_next['title'],         # RAW
-                    'Target_Next_Role': role_next['normalized_title'],  # NORMALIZED (for training)
+                    'Target_Next_Role_Raw': role_next['title'],
+                    'Target_Next_Role': role_next['normalized_title'],
+                    'Target_Next_Unit': target_unit, # NEW TARGET
                     'snapshot_history': current_history,
                     'snapshot_date': decision_date
                 }
