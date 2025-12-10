@@ -10,6 +10,7 @@ import json
 
 from src.data_processor import DataProcessor
 from src.feature_engineering import FeatureEngineer
+from src.sequential_recommender import SequentialRecommender
 
 class ModelTrainer:
     def __init__(self, models_dir='models'):
@@ -22,6 +23,7 @@ class ModelTrainer:
         self.unit_encoder = None
         self.role_model = None
         self.unit_model = None
+        self.seq_model = None # NEW
         self.feature_cols = []
 
     def train(self, csv_path):
@@ -45,6 +47,13 @@ class ModelTrainer:
         kb_cols = ['Rank', 'Branch', 'last_role_title', 'Target_Next_Role', 'Target_Next_Role_Raw']
         kb_df = df_transitions[kb_cols].copy()
         kb_df.to_csv(os.path.join(self.models_dir, 'knowledge_base.csv'), index=False)
+
+        # --- MODEL C: SEQUENTIAL RECOMMENDER ---
+        print("\n" + "="*40)
+        print("TRAINING MODEL C: Sequential Patterns")
+        print("="*40)
+        self.seq_model = SequentialRecommender()
+        self.seq_model.fit(df_transitions)
 
         # Features
         cat_features = ['Rank', 'Branch', 'Pool', 'Entry_type',
@@ -115,7 +124,7 @@ class ModelTrainer:
         y_unit_enc_filtered = self.unit_encoder.transform(y_unit[mask_unit].astype(str))
         
         X_train_u, X_test_u, y_train_u, y_test_u = train_test_split(X_unit, y_unit_enc_filtered, test_size=0.2, random_state=42, stratify=y_unit_enc_filtered)
-        
+
         self.unit_model = lgb.LGBMClassifier(
             objective='multiclass',
             num_class=len(self.unit_encoder.classes_),
@@ -135,6 +144,7 @@ class ModelTrainer:
         # Compress
         joblib.dump(self.role_model, os.path.join(self.models_dir, 'role_model.pkl'), compress=3)
         joblib.dump(self.unit_model, os.path.join(self.models_dir, 'unit_model.pkl'), compress=3)
+        joblib.dump(self.seq_model, os.path.join(self.models_dir, 'seq_model.pkl'), compress=3) # NEW
         joblib.dump(self.encoders, os.path.join(self.models_dir, 'feature_encoders.pkl'), compress=3)
         joblib.dump(self.role_encoder, os.path.join(self.models_dir, 'role_encoder.pkl'), compress=3)
         joblib.dump(self.unit_encoder, os.path.join(self.models_dir, 'unit_encoder.pkl'), compress=3)
