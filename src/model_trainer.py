@@ -54,7 +54,7 @@ class ModelTrainer:
                         'count_command_training', 'count_tactical_training', 'count_science_training',
                         'count_engineering_training', 'count_medical_training']
         
-        target_col = 'Target_Next_Role' # <-- CHANGED TARGET
+        target_col = 'Generalized_Role' # <-- UPDATED to Generalized Role
         
         # Filter columns
         X = df_transitions[cat_features + num_features].copy()
@@ -126,7 +126,7 @@ class ModelTrainer:
         print(f"Top-5 Accuracy: {top5_acc:.4f}")
         
         # 7. Save Artifacts
-        self.save_artifacts()
+        # self.save_artifacts()
         
     def _top_k_accuracy(self, y_true, y_proba, k=5):
         # Setup

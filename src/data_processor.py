@@ -10,6 +10,26 @@ class DataProcessor:
         # CHANGED: \s+ to \s* to handle "Title(Date)" without space
         self.entry_pattern = re.compile(r'(.*?)\s*\((\d{2}\s+[A-Z]{3}\s+\d{4})\s*-\s*(.*?)\)')
         
+    def normalize_role(self, role_name):
+        """
+        Normalizes a specific role title into a generalized role category.
+        e.g. "Div Officer USS Vanguard / Post 1" -> "Div Officer"
+             "Head of Deptt SS Gateway" -> "Head of Deptt"
+        """
+        if not isinstance(role_name, str):
+            return "Unknown"
+
+        # 1. Strip Post Number (e.g., " / Post 1")
+        role = re.sub(r'\s*/\s*Post\s*\d+', '', role_name, flags=re.IGNORECASE)
+
+        # 2. Strip Unit Identifiers (USS, SS, ISS, RS, CS, GS, NAS)
+        # We strip the prefix and everything after it?
+        # "Div Officer USS Vanguard" -> "Div Officer"
+        # "Head of Deptt SS Gateway" -> "Head of Deptt"
+        role = re.sub(r'\s+\b(USS|SS|ISS|RS|CS|GS|NAS)\b.*', '', role)
+
+        return role.strip()
+
     def parse_date(self, date_str):
         """Parses dates like '25 NOV 1975' or '25/11/1975'. Returns datetime object or NaT."""
         if not date_str or str(date_str).strip() == '':
@@ -195,6 +215,7 @@ class DataProcessor:
                     'Entry_type': row['Entry_type'],
                     'Rank': rank_at_time,
                     'Target_Next_Role': role_next['title'],
+                    'Generalized_Role': self.normalize_role(role_next['title']), # New Generalized Target
                     'snapshot_history': current_history, # Special field for FeatureEngineer
                     'snapshot_date': decision_date
                 }
