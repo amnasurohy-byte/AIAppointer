@@ -64,11 +64,17 @@ class ModelTrainer:
         df_transitions = fe.extract_features(df_transitions)
         
         # 2. Prepare Features (X) and Target (y)
-        cat_features = ['Rank', 'Branch', 'Pool', 'Entry_type', 'last_role_title']
+        # --- UPDATED FEATURE LIST ---
+        # Added: prev_role_2, prev_role_3, last_training_title
+        cat_features = ['Rank', 'Branch', 'Pool', 'Entry_type',
+                        'last_role_title', 'prev_role_2', 'prev_role_3', 'last_training_title']
+
+        # Added: days_since_last_training
         num_features = ['years_service', 'days_in_last_role', 'years_in_current_rank', 'num_prior_roles', 
                         'num_training_courses', 
                         'count_command_training', 'count_tactical_training', 'count_science_training',
-                        'count_engineering_training', 'count_medical_training']
+                        'count_engineering_training', 'count_medical_training',
+                        'days_since_last_training']
         
         target_col = 'Target_Next_Role' # Now this is the NORMALIZED role
         

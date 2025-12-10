@@ -46,15 +46,13 @@ class Predictor:
         df = self.dp.get_current_features(df)
         df = self.fe.extract_features(df)
         
-        # 2. Encoding
-        cat_features = ['Rank', 'Branch', 'Pool', 'Entry_type', 'last_role_title']
+        # 2. Encoding - DYNAMIC (Driven by self.encoders keys)
+        # This ensures we cover all categorical features trained (including prev_role_X)
         current_ranks = input_df['Rank'].tolist()
         current_branches = input_df['Branch'].tolist()
-        current_pools = input_df['Pool'].tolist()
         
-        for col in cat_features:
-            if col in self.encoders:
-                le = self.encoders[col]
+        for col, le in self.encoders.items():
+            if col in df.columns:
                 known_classes = set(le.classes_)
                 def encode_safe(val):
                     val_str = str(val)
@@ -64,7 +62,12 @@ class Predictor:
                          return le.transform(['Unknown'])[0]
                     return 0 
                 df[col] = df[col].apply(encode_safe)
+            else:
+                # If a feature is missing in input but was trained, fill with 0/Unknown
+                # (Ideally extract_features handles this, but safety first)
+                df[col] = 0
 
+        # Ensure all numeric features exist too
         for col in self.feature_cols:
             if col not in df.columns:
                 df[col] = 0
@@ -229,12 +232,9 @@ class Predictor:
         df = self.dp.get_current_features(df)
         df = self.fe.extract_features(df)
         
-        # 2. Encoding (Standard)
-        cat_features = ['Rank', 'Branch', 'Pool', 'Entry_type', 'last_role_title']
-        for col in cat_features:
-            if col in self.encoders:
-                le = self.encoders[col]
-                # ... (Standard encoding logic omitted for brevity, same as predict)
+        # 2. Encoding - Dynamic
+        for col, le in self.encoders.items():
+            if col in df.columns:
                 known_classes = set(le.classes_)
                 def encode_safe(val):
                     val_str = str(val)
