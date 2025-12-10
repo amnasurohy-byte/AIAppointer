@@ -29,12 +29,21 @@ def generate_constraints(dataset_path, output_dir='models', verbose=True):
     df_transitions = dp.create_transition_dataset(df)
     
     role_constraints = {}
+    role_map = {} # Generalized -> [Specific Roles]
+
     all_roles = df_transitions['Target_Next_Role'].unique()
     
     if verbose:
         print(f"Analyzing {len(all_roles)} unique roles...")
     
     for role in all_roles:
+        # Get Generalized Name
+        gen_role = dp.normalize_role(role)
+        if gen_role not in role_map:
+            role_map[gen_role] = []
+        if role not in role_map[gen_role]:
+            role_map[gen_role].append(role)
+
         subset = df_transitions[df_transitions['Target_Next_Role'] == role]
         
         allowed_ranks = list(subset['Rank'].unique())
@@ -49,7 +58,8 @@ def generate_constraints(dataset_path, output_dir='models', verbose=True):
         role_constraints[role] = {
             'ranks': allowed_ranks,
             'branches': allowed_branches,
-            'pools': allowed_pools
+            'pools': allowed_pools,
+            'generalized_role': gen_role
         }
     
     # Save
@@ -59,9 +69,14 @@ def generate_constraints(dataset_path, output_dir='models', verbose=True):
     output_path = os.path.join(output_dir, 'all_constraints.json')
     with open(output_path, 'w') as f:
         json.dump(role_constraints, f, indent=2)
+
+    map_path = os.path.join(output_dir, 'role_map.json')
+    with open(map_path, 'w') as f:
+        json.dump(role_map, f, indent=2)
     
     if verbose:
         print(f"✓ Saved {len(role_constraints)} role constraints to {output_path}")
+        print(f"✓ Saved {len(role_map)} generalized mappings to {map_path}")
     
     return role_constraints
 

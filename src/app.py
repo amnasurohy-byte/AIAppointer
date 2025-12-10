@@ -279,8 +279,14 @@ def main():
         st.header("Find Candidates for Role")
         st.markdown("Reverse search: Select a target role to find the best fit officers.")
         
-        all_roles = sorted(predictor.target_encoder.classes_)
-        target_role = st.selectbox("Target Appointment", all_roles)
+        # In Two-Stage, target_encoder.classes_ are Generalized Roles.
+        # But Billet Lookup should ideally allow looking up SPECIFIC roles.
+        # However, the constraint system has keys for specific roles.
+        # So we can list keys from constraints.
+
+        # Get all specific roles from constraints that have complete data
+        all_specific_roles = sorted(predictor.constraints.keys())
+        target_role = st.selectbox("Target Appointment", all_specific_roles)
         
         # Show constraints for this role if available
         constraints = predictor.constraints.get(target_role, {})

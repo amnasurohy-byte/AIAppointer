@@ -34,6 +34,17 @@ class Predictor:
              else:
                  self.constraints = {}
         
+        # Load Role Map (Generalized -> Specific)
+        map_path = os.path.join(models_dir, 'role_map.json')
+        if os.path.exists(map_path):
+             print(f"Loading Role Map from {map_path}")
+             import json
+             with open(map_path, 'r') as f:
+                 self.role_map = json.load(f)
+        else:
+             print("Warning: role_map.json not found. Two-stage prediction will be limited.")
+             self.role_map = {}
+
         # Initialize processors
         self.dp = DataProcessor()
         self.fe = FeatureEngineer()
@@ -91,7 +102,8 @@ class Predictor:
             user_rank_idx = rank_map.get(user_rank, -1)
             user_branch = str(current_branches[i]).strip()
             user_pool = str(current_pools[i]).strip()
-            
+            row_features = df.iloc[i]
+
             # Repetition Handling (History)
             history = df.iloc[i]['prior_appointments']
             past_titles = set()
@@ -100,158 +112,187 @@ class Predictor:
             current_role_str = str(input_df.iloc[i]['current_appointment']).strip()
             past_titles.add(current_role_str)
             
-            valid_indices = []
+            # TWO-STAGE PREDICTION LOGIC
+            # 1. We have probabilities for GENERALIZED ROLES (all_classes)
+            # 2. We need to expand these to SPECIFIC ROLES (using self.role_map)
+            # 3. We apply constraints to SPECIFIC ROLES and re-score
+
+            candidate_roles = []
+
+            # Threshold to consider generalized role (optimization)
+            # Only consider top N generalized roles to expand? Or all?
+            # All is safer but slower. Let's do all with > 0 probability.
             
-            for c_idx, role_name in enumerate(all_classes):
-                # Default allow
-                probs[c_idx] *= 1.0 
+            for gen_idx, gen_role_name in enumerate(all_classes):
+                gen_prob = probs[gen_idx]
+                # if gen_prob < 0.001: continue # Skip low prob
                 
-                if role_name not in self.constraints:
-                    # No info? Risk. Allow but maybe penalty?
-                    pass
+                # Get specific roles mapping to this generalized role
+                specific_roles = self.role_map.get(gen_role_name, [gen_role_name])
+                if not specific_roles: specific_roles = [gen_role_name]
+
+                # Distribute probability among specific roles?
+                # Or give each specific role the generalized probability?
+                # Heuristic: Each specific role inherits the generalized probability,
+                # then we filter by constraints.
+
+                for specific_role in specific_roles:
+                    candidate_roles.append({
+                        'role': specific_role,
+                        'base_prob': gen_prob,
+                        'gen_role': gen_role_name
+                    })
+
+            # Now filter and rank specific candidates
+            final_candidates = []
+
+            for item in candidate_roles:
+                role_name = item['role']
+                base_prob = item['base_prob']
+
+                # Get constraints for SPECIFIC role
+                # Note: role_constraints in all_constraints.json are keyed by SPECIFIC role
+                const = self.constraints.get(role_name, {})
+
+                # 1. Rank Constraint
+                allowed_ranks = const.get('ranks', [])
+                rank_match = False
+                boost_mult = 1.0
+
+                if not allowed_ranks or 'Unknown' in allowed_ranks:
+                    rank_match = True
                 else:
-                    const = self.constraints[role_name]
-                    
-                    # 1. Rank Constraint (Directional Flexibility)
-                    allowed_ranks = const.get('ranks', [])
-                    
-                    rank_match = False
-                    if not allowed_ranks or 'Unknown' in allowed_ranks:
-                        # No constraint data - allow but risky
-                        rank_match = True
-                    else:
-                        # Check if role's allowed ranks are within flexibility range
-                        for r in allowed_ranks:
-                             r_idx = rank_map.get(str(r).strip(), -1)
-                             if r_idx == -1: 
-                                 continue
-                             
-                             # Directional matching:
-                             # rank_flex_up: allow roles UP TO N ranks above (promotions)
-                             # rank_flex_down: allow roles UP TO N ranks below (demotions)
-                             rank_diff = r_idx - user_rank_idx
-                             
-                             if rank_diff >= 0:  # Role is same rank or higher (promotion)
-                                 if rank_diff <= rank_flex_up:
-                                     rank_match = True
-                                     # BOOST: If this is a promotion role and user enabled promotion flexibility
-                                     # Apply a boost to make promotions more visible
-                                     if rank_diff > 0 and rank_flex_up > 0:
-                                         # Boost factor: 2x for each rank level up
-                                         boost_factor = 2.0 ** rank_diff
-                                         probs[c_idx] *= boost_factor
-                                     break
-                             else:  # Role is lower rank (demotion)
-                                 if abs(rank_diff) <= rank_flex_down:
-                                     rank_match = True
-                                     break
-                    
-                    if not rank_match:
-                        probs[c_idx] = 0.0
-                        continue
-                        
-                    # 2. Branch Constraint
-                    allowed_branches = const.get('branches', [])
-                    if allowed_branches:
-                        if user_branch not in allowed_branches:
-                             probs[c_idx] = 0.0
-                             continue
-                             
-                    # 3. Pool Constraint
-                    allowed_pools = const.get('pools', [])
-                    if allowed_pools:
-                         if user_pool not in allowed_pools:
-                              # Pools can be fluid? Maybe soft penalty instead of hard kill?
-                              # "we dont want to pursue novelty at the cost of accuracy" -> Hard constraint is safer.
-                              probs[c_idx] = 0.0
-                              continue
+                    for r in allowed_ranks:
+                         r_idx = rank_map.get(str(r).strip(), -1)
+                         if r_idx == -1: continue
+
+                         rank_diff = r_idx - user_rank_idx
+                         if rank_diff >= 0: # Promotion or Lateral
+                             if rank_diff <= rank_flex_up:
+                                 rank_match = True
+                                 if rank_diff > 0 and rank_flex_up > 0:
+                                     # Stronger boost for promotions to ensure they appear
+                                     # Base prob for next rank is often 10-100x lower than current rank
+                                     boost_mult = 10.0 ** rank_diff
+                                 break
+                         else: # Demotion
+                             if abs(rank_diff) <= rank_flex_down:
+                                 rank_match = True
+                                 break
+
+                if not rank_match: continue
+
+                # 2. Branch Constraint
+                allowed_branches = const.get('branches', [])
+                if allowed_branches:
+                    if user_branch not in allowed_branches:
+                         continue
+
+                # 3. Pool Constraint
+                allowed_pools = const.get('pools', [])
+                if allowed_pools:
+                     if user_pool not in allowed_pools:
+                          continue
 
                 # 4. Repetition Penalty
+                penalty_mult = 1.0
                 if role_name.strip() in past_titles:
-                     probs[c_idx] *= 0.1 # 10% probability remaining
+                     penalty_mult = 0.1
                 
-                if probs[c_idx] > 0:
-                    valid_indices.append(c_idx)
+                final_score = base_prob * boost_mult * penalty_mult
 
-            # Normalize
-            total = probs.sum()
-            if total > 0:
-                probs = probs / total
+                final_candidates.append({
+                    'role': role_name,
+                    'score': final_score,
+                    'const': const
+                })
             
-            # Top 5
-            top_k_idx = np.argsort(probs)[-5:][::-1]
-            top_k_labels = self.target_encoder.inverse_transform(top_k_idx)
-            top_k_probs = probs[top_k_idx]
+            # Sort by score
+            final_candidates.sort(key=lambda x: x['score'], reverse=True)
             
-            # Explanations
+            # Take Top 5
+            top_5 = final_candidates[:5]
+            
+            # Normalize scores for display (Confidence)
+            total_score = sum(x['score'] for x in top_5) if top_5 else 1.0
+            if total_score == 0: total_score = 1.0
+            
+            prediction_labels = []
+            confidence_values = []
             explanations = []
-            
-            # Extract row features for explanation
-            # We need to access the derived features (years_service, etc) from 'df' (the processed one)
-            # But 'df' has N rows matching len(X).
-            row_features = df.iloc[i]
-            
-            for idx, label in zip(top_k_idx, top_k_labels):
-                 p = probs[idx]
-                 reasons = []
-                 
-                 # 1. Rank Progression
-                 role_ranks = self.constraints.get(label, {}).get('ranks', [])
-                 avg_role_rank_idx = -1
-                 if role_ranks:
-                      for rr in role_ranks:
-                           rid = rank_map.get(rr, -1)
-                           if rid != -1: 
-                               avg_role_rank_idx = rid
-                               break
-                 
-                 if avg_role_rank_idx > user_rank_idx:
+
+            for cand in top_5:
+                label = cand['role']
+                score = cand['score']
+                normalized_score = score / total_score # This is relative confidence among top 5
+                # Or should we use original probability?
+                # Original prob is better but might be low.
+                # Let's show relative confidence of the top recommendations.
+
+                prediction_labels.append(label)
+                confidence_values.append(normalized_score)
+
+                # Generate Explanation
+                reasons = []
+                const = cand['const']
+
+                # Rank
+                role_ranks = const.get('ranks', [])
+                avg_role_rank_idx = -1
+                if role_ranks:
+                     for rr in role_ranks:
+                          rid = rank_map.get(rr, -1)
+                          if rid != -1:
+                              avg_role_rank_idx = rid
+                              break
+
+                if avg_role_rank_idx > user_rank_idx:
                       reasons.append("Promotion Step")
-                 elif avg_role_rank_idx == user_rank_idx:
+                elif avg_role_rank_idx == user_rank_idx:
                       reasons.append("Lateral Move")
-                 elif avg_role_rank_idx < user_rank_idx and avg_role_rank_idx != -1:
-                      reasons.append("Seniority Consolidation") # Euphemism for lower rank role
-                 
-                 # 2. Branch Fit
-                 role_branches = self.constraints.get(label, {}).get('branches', [])
-                 if user_branch in role_branches:
+                elif avg_role_rank_idx < user_rank_idx and avg_role_rank_idx != -1:
+                      reasons.append("Seniority Consolidation")
+
+                # Branch
+                role_branches = const.get('branches', [])
+                if user_branch in role_branches:
                       reasons.append(f"{user_branch} Branch Fit")
-                 
-                 # 3. Experience / Training Fit (The "Why")
-                 # We simply check if the Role Title maps to a training category
-                 label_lower = label.lower()
-                 if 'command' in label_lower or 'captain' in label_lower or 'xo' in label_lower:
+
+                # Training
+                label_lower = label.lower()
+                if 'command' in label_lower or 'captain' in label_lower or 'xo' in label_lower:
                       if row_features.get('count_command_training', 0) > 0:
                            reasons.append("Command Trained")
-                 if 'tactical' in label_lower or 'security' in label_lower:
+                if 'tactical' in label_lower or 'security' in label_lower:
                       if row_features.get('count_tactical_training', 0) > 0:
                            reasons.append("Tactical Trained")
-                 if 'engineer' in label_lower or 'warp' in label_lower:
+                if 'engineer' in label_lower or 'warp' in label_lower:
                       if row_features.get('count_engineering_training', 0) > 0:
                            reasons.append("Engineering Trained")
-                 if 'science' in label_lower or 'sensor' in label_lower:
+                if 'science' in label_lower or 'sensor' in label_lower:
                       if row_features.get('count_science_training', 0) > 0:
                            reasons.append("Science Trained")
-                 
-                 # 4. Seniority Fit
-                 # If years_service > 10 and role is senior
-                 if row_features.get('years_service', 0) > 15:
+
+                if row_features.get('years_service', 0) > 15:
                       reasons.append("High Seniority")
-                 elif row_features.get('years_service', 0) < 3:
+                elif row_features.get('years_service', 0) < 3:
                       reasons.append("Early Career")
-                 
-                 # 5. History Penalty Mention
-                 if label in past_titles:
+
+                if label in past_titles:
                       reasons.append("Repeat Role (Caution)")
-                 
-                 # Join
-                 # Limit to top 3 reasons to keep UI clean
-                 explanations.append(", ".join(reasons[:3]))
+
+                explanations.append(", ".join(reasons[:3]))
+
+            # Fill if empty
+            if not prediction_labels:
+                prediction_labels = ["No suitable role found"]
+                confidence_values = [0.0]
+                explanations = ["Constraints too strict"]
 
             res = pd.DataFrame({
-                'Rank Info': range(1, 6),
-                'Prediction': top_k_labels,
-                'Confidence': top_k_probs,
+                'Rank Info': range(1, len(prediction_labels) + 1),
+                'Prediction': prediction_labels,
+                'Confidence': confidence_values,
                 'Explanation': explanations
             })
             results.append(res)
