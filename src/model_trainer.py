@@ -6,6 +6,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import accuracy_score
 import os
+import json
 
 from src.data_processor import DataProcessor
 from src.feature_engineering import FeatureEngineer
@@ -23,7 +24,7 @@ class ModelTrainer:
 
     def train(self, csv_path):
         print("="*60)
-        print("STEP 1: Generating Role Constraints")
+        print("STEP 1: Generating Role Constraints (Based on Generalized Roles)")
         print("="*60)
         from src.constraint_generator import generate_constraints
         generate_constraints(csv_path, output_dir=self.models_dir, verbose=True)
@@ -38,29 +39,44 @@ class ModelTrainer:
         print("Running Data Pipeline (Transition Mode)...")
         dp = DataProcessor()
         # Create Transition Dataset (Exploded)
-        # Note: create_transition_dataset internall calls get_current_features if needed.
         df_transitions = dp.create_transition_dataset(df)
         print(f"Dataset exploded from {len(df)} officers to {len(df_transitions)} transitions.")
         
+        # --- NEW: Build Billet Map (Generalized -> [Specifics]) ---
+        print("Building Billet Map for Specificity...")
+        billet_map = {}
+        for idx, row in df_transitions.iterrows():
+            gen = row['Target_Next_Role']
+            raw = row['Target_Next_Role_Raw']
+
+            if gen not in billet_map:
+                billet_map[gen] = set()
+            billet_map[gen].add(raw)
+
+        # Convert sets to lists for JSON serialization
+        final_billet_map = {k: sorted(list(v)) for k, v in billet_map.items()}
+        with open(os.path.join(self.models_dir, 'billet_map.json'), 'w') as f:
+            json.dump(final_billet_map, f, indent=2)
+        print(f"Mapped {len(billet_map)} generalized roles to {sum(len(v) for v in billet_map.values())} specific billets.")
+        # -----------------------------------------------------------
+
         fe = FeatureEngineer()
         df_transitions = fe.extract_features(df_transitions)
         
         # 2. Prepare Features (X) and Target (y)
-        # Define categorical features
         cat_features = ['Rank', 'Branch', 'Pool', 'Entry_type', 'last_role_title']
-        # Updated feature list (Phase 3)
         num_features = ['years_service', 'days_in_last_role', 'years_in_current_rank', 'num_prior_roles', 
                         'num_training_courses', 
                         'count_command_training', 'count_tactical_training', 'count_science_training',
                         'count_engineering_training', 'count_medical_training']
         
-        target_col = 'Target_Next_Role' # <-- CHANGED TARGET
+        target_col = 'Target_Next_Role' # Now this is the NORMALIZED role
         
         # Filter columns
         X = df_transitions[cat_features + num_features].copy()
         y = df_transitions[target_col].copy()
         
-        # Filter out classes with < 2 samples (cannot stratify/train/test split properly)
+        # Filter out classes with < 2 samples
         class_counts = y.value_counts()
         valid_classes = class_counts[class_counts >= 2].index
         mask = y.isin(valid_classes)
@@ -81,7 +97,6 @@ class ModelTrainer:
         self.target_encoder = LabelEncoder()
         y = self.target_encoder.fit_transform(y.astype(str))
         
-        # Save feature names for inference
         self.feature_cols = cat_features + num_features
         
         # 4. Split (Stratified)
@@ -91,16 +106,12 @@ class ModelTrainer:
         
         # 5. Train LightGBM
         print(f"Training LightGBM on {len(X_train)} samples...")
-        # Create dataset
-        # dtrain = lgb.Dataset(X_train, label=y_train, categorical_feature=cat_features) # using indices
-        # We passed encoded integers, so we should tell LGBM which are categorical
-        # Get indices of cat features
         cat_indices = [X.columns.get_loc(c) for c in cat_features]
         
         self.model = lgb.LGBMClassifier(
             objective='multiclass',
             num_class=len(self.target_encoder.classes_),
-            n_estimators=200,
+            n_estimators=50,
             learning_rate=0.05,
             random_state=42,
             n_jobs=-1
@@ -119,8 +130,6 @@ class ModelTrainer:
         acc = accuracy_score(y_test, y_pred)
         print(f"Top-1 Accuracy: {acc:.4f}")
         
-        # Top-5 Accuracy?
-        # verify dimensionality
         probas = self.model.predict_proba(X_test)
         top5_acc = self._top_k_accuracy(y_test, probas, k=5)
         print(f"Top-5 Accuracy: {top5_acc:.4f}")
