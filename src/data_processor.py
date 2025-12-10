@@ -9,6 +9,44 @@ class DataProcessor:
         # Using non-greedy .*? to capture title up to the date parenthesis
         # CHANGED: \s+ to \s* to handle "Title(Date)" without space
         self.entry_pattern = re.compile(r'(.*?)\s*\((\d{2}\s+[A-Z]{3}\s+\d{4})\s*-\s*(.*?)\)')
+
+    def normalize_title(self, title):
+        """
+        Normalizes a role title by stripping specific unit identifiers and post numbers.
+        Example: "Head of Deptt USS Orion / Post 1" -> "Head of Deptt"
+        """
+        if pd.isna(title): return "Unknown"
+        title = str(title).strip()
+
+        # 1. Strip Post suffix (e.g. " / Post 1")
+        title = re.sub(r'\s*/\s*Post\s*\d+', '', title, flags=re.IGNORECASE)
+
+        # 2. Strip Ship Names (USS, ISS, etc.)
+        # Look for the pattern: "Role Title UNIT_PREFIX Name"
+        # We assume the Role Title comes before the Unit Prefix.
+        # Prefixes: USS, ISS, SS, CS, RS
+        title = re.sub(r'\s+(USS|ISS|SS|CS|RS)\s+.*', '', title)
+
+        # 3. Strip " - " separated suffixes (e.g. "Staff Officer SFHQ - Resource Management")
+        # But allow "Staff Officer - SFHQ"? No, usually "Role - Unit".
+        # We strip the suffix.
+        if ' - ' in title:
+            title = title.split(' - ')[0]
+
+        # 4. specific known unit prefixes that might not be caught
+        # "Dy Manager Fleet Maintenance Wing Alpha" -> "Dy Manager"
+        units = [
+            'Fleet Maintenance', 'Systems Maintenance', 'Starbase Support',
+            'Dockyard', 'Planetary Repair', 'Hull Repair'
+        ]
+        for unit in units:
+            if unit in title:
+                # Split and take first part
+                parts = title.split(unit)
+                if len(parts) > 1 and len(parts[0].strip()) > 0:
+                    title = parts[0].strip()
+
+        return title.strip()
         
     def parse_date(self, date_str):
         """Parses dates like '25 NOV 1975' or '25/11/1975'. Returns datetime object or NaT."""
@@ -195,6 +233,7 @@ class DataProcessor:
                     'Entry_type': row['Entry_type'],
                     'Rank': rank_at_time,
                     'Target_Next_Role': role_next['title'],
+                    'Target_General_Role': self.normalize_title(role_next['title']),
                     'snapshot_history': current_history, # Special field for FeatureEngineer
                     'snapshot_date': decision_date
                 }

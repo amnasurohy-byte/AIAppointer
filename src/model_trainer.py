@@ -54,7 +54,7 @@ class ModelTrainer:
                         'count_command_training', 'count_tactical_training', 'count_science_training',
                         'count_engineering_training', 'count_medical_training']
         
-        target_col = 'Target_Next_Role' # <-- CHANGED TARGET
+        target_col = 'Target_General_Role' # <-- CHANGED TARGET to Generalized Role
         
         # Filter columns
         X = df_transitions[cat_features + num_features].copy()
