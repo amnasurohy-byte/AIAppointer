@@ -42,34 +42,25 @@ class ModelTrainer:
         df_transitions = dp.create_transition_dataset(df)
         print(f"Dataset exploded from {len(df)} officers to {len(df_transitions)} transitions.")
         
-        # --- NEW: Build Billet Map (Generalized -> [Specifics]) ---
-        print("Building Billet Map for Specificity...")
-        billet_map = {}
-        for idx, row in df_transitions.iterrows():
-            gen = row['Target_Next_Role']
-            raw = row['Target_Next_Role_Raw']
-
-            if gen not in billet_map:
-                billet_map[gen] = set()
-            billet_map[gen].add(raw)
-
-        # Convert sets to lists for JSON serialization
-        final_billet_map = {k: sorted(list(v)) for k, v in billet_map.items()}
-        with open(os.path.join(self.models_dir, 'billet_map.json'), 'w') as f:
-            json.dump(final_billet_map, f, indent=2)
-        print(f"Mapped {len(billet_map)} generalized roles to {sum(len(v) for v in billet_map.values())} specific billets.")
-        # -----------------------------------------------------------
-
         fe = FeatureEngineer()
         df_transitions = fe.extract_features(df_transitions)
         
+        # --- NEW: Save Knowledge Base for CBR (Specificity) ---
+        print("Saving Knowledge Base for Specificity Ranking...")
+        # We need: Rank, Branch, last_role_title, Target_Next_Role (Gen), Target_Next_Role_Raw
+        kb_cols = ['Rank', 'Branch', 'last_role_title', 'Target_Next_Role', 'Target_Next_Role_Raw']
+
+        # Ensure 'last_role_title' is populated (it was by extract_features)
+        # We save this as a lightweight CSV or Parquet
+        kb_df = df_transitions[kb_cols].copy()
+        kb_df.to_csv(os.path.join(self.models_dir, 'knowledge_base.csv'), index=False)
+        print(f"Saved {len(kb_df)} case examples to knowledge_base.csv")
+        # -----------------------------------------------------------
+
         # 2. Prepare Features (X) and Target (y)
-        # --- UPDATED FEATURE LIST ---
-        # Added: prev_role_2, prev_role_3, last_training_title
         cat_features = ['Rank', 'Branch', 'Pool', 'Entry_type',
                         'last_role_title', 'prev_role_2', 'prev_role_3', 'last_training_title']
 
-        # Added: days_since_last_training
         num_features = ['years_service', 'days_in_last_role', 'years_in_current_rank', 'num_prior_roles', 
                         'num_training_courses', 
                         'count_command_training', 'count_tactical_training', 'count_science_training',
@@ -78,7 +69,6 @@ class ModelTrainer:
         
         target_col = 'Target_Next_Role' # Now this is the NORMALIZED role
         
-        # Filter columns
         X = df_transitions[cat_features + num_features].copy()
         y = df_transitions[target_col].copy()
         

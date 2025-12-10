@@ -4,6 +4,7 @@ import joblib
 import os
 import lightgbm as lgb
 import json
+import re
 from src.data_processor import DataProcessor
 from src.feature_engineering import FeatureEngineer
 
@@ -24,19 +25,60 @@ class Predictor:
         else:
              self.constraints = {}
 
-        # Load Billet Map (Generalized -> Specific)
-        billet_map_path = os.path.join(models_dir, 'billet_map.json')
-        if os.path.exists(billet_map_path):
-            print(f"Loading Billet Map from {billet_map_path}")
-            with open(billet_map_path, 'r') as f:
-                self.billet_map = json.load(f)
+        # Load Knowledge Base for CBR
+        kb_path = os.path.join(models_dir, 'knowledge_base.csv')
+        if os.path.exists(kb_path):
+            print(f"Loading Knowledge Base from {kb_path}")
+            self.kb_df = pd.read_csv(kb_path)
+            # Create simple lookup index by Normalized Role
+            self.kb_lookup = {}
+            for role, group in self.kb_df.groupby('Target_Next_Role'):
+                self.kb_lookup[role] = group
         else:
-            self.billet_map = {}
+             print("Warning: No Knowledge Base found. Specificity will be limited.")
+             self.kb_lookup = {}
         
         # Initialize processors
         self.dp = DataProcessor()
         self.fe = FeatureEngineer()
         
+    def _find_similar_cases(self, generalized_role, user_row, top_k=3):
+        """
+        Finds specific billets from history by matching User against Knowledge Base.
+        Case-Based Reasoning (CBR).
+        """
+        if generalized_role not in self.kb_lookup:
+            return [generalized_role] # Fallback
+
+        candidates = self.kb_lookup[generalized_role].copy()
+
+        # Scoring Similarity
+        # 1. Rank Match (Exact)
+        user_rank = str(user_row['Rank'])
+        candidates['score'] = (candidates['Rank'] == user_rank).astype(int) * 10
+
+        # 2. Branch Match (Exact)
+        user_branch = str(user_row['Branch'])
+        candidates['score'] += (candidates['Branch'] == user_branch).astype(int) * 5
+
+        # 3. Last Role Title Match (Exact or normalized)
+        # Getting last role from user_row (which is a Series from extracted features)
+        # We need to ensure we are comparing apples to apples.
+        # KB has 'last_role_title' (normalized).
+        # user_row should have 'last_role_title' (normalized) from FeatureEngineer.
+        user_last_role = str(user_row.get('last_role_title', ''))
+        candidates['score'] += (candidates['last_role_title'] == user_last_role).astype(int) * 20
+
+        # Sort
+        # Add random noise to break ties
+        candidates['score'] += np.random.random(len(candidates))
+
+        candidates = candidates.sort_values('score', ascending=False)
+
+        # Return unique raw titles
+        best_matches = candidates['Target_Next_Role_Raw'].unique()[:top_k]
+        return list(best_matches)
+
     def predict(self, input_df, rank_flex_up=0, rank_flex_down=0):
         """
         Predicts next specific appointment via two-stage process.
@@ -46,8 +88,7 @@ class Predictor:
         df = self.dp.get_current_features(df)
         df = self.fe.extract_features(df)
         
-        # 2. Encoding - DYNAMIC (Driven by self.encoders keys)
-        # This ensures we cover all categorical features trained (including prev_role_X)
+        # 2. Encoding - DYNAMIC
         current_ranks = input_df['Rank'].tolist()
         current_branches = input_df['Branch'].tolist()
         
@@ -63,8 +104,6 @@ class Predictor:
                     return 0 
                 df[col] = df[col].apply(encode_safe)
             else:
-                # If a feature is missing in input but was trained, fill with 0/Unknown
-                # (Ideally extract_features handles this, but safety first)
                 df[col] = 0
 
         # Ensure all numeric features exist too
@@ -75,7 +114,7 @@ class Predictor:
         X = df[self.feature_cols]
         probas = self.model.predict_proba(X)
         
-        # 4. Apply Constraints to Generalized Roles
+        # 4. Apply Constraints
         results = []
         all_classes = self.target_encoder.classes_
         
@@ -92,7 +131,6 @@ class Predictor:
             history = df.iloc[i]['prior_appointments']
             past_titles = set()
             if history and isinstance(history, list):
-                # We need to normalize past titles to check against generalized predictions
                 past_titles = {self.dp.normalize_role_title(h['title']) for h in history}
             
             # --- STAGE 1: Generalized Prediction ---
@@ -100,7 +138,6 @@ class Predictor:
                 # Apply constraints (Logic unchanged)
                 if role_name in self.constraints:
                     const = self.constraints[role_name]
-                    
                     # Rank
                     allowed_ranks = const.get('ranks', [])
                     rank_match = False
@@ -110,23 +147,19 @@ class Predictor:
                         for r in allowed_ranks:
                              r_idx = rank_map.get(str(r).strip(), -1)
                              if r_idx == -1: continue
-                             
                              rank_diff = r_idx - user_rank_idx
                              if rank_diff >= 0:
                                  if rank_diff <= rank_flex_up:
                                      rank_match = True
-                                     if rank_diff > 0 and rank_flex_up > 0:
-                                         probs[c_idx] *= (2.0 ** rank_diff)
+                                     if rank_diff > 0 and rank_flex_up > 0: probs[c_idx] *= (2.0 ** rank_diff)
                                      break
                              else:
                                  if abs(rank_diff) <= rank_flex_down:
                                      rank_match = True
                                      break
-                    
                     if not rank_match:
                         probs[c_idx] = 0.0
                         continue
-                        
                     # Branch
                     allowed_branches = const.get('branches', [])
                     if allowed_branches and user_branch not in allowed_branches:
@@ -147,42 +180,41 @@ class Predictor:
             top_k_labels = self.target_encoder.inverse_transform(top_k_idx)
             top_k_probs = probs[top_k_idx]
             
-            # --- STAGE 2: Specificity Expansion ---
+            # --- STAGE 2: Specificity Expansion via CBR ---
             final_predictions = []
             final_confidences = []
             final_explanations = []
             
-            row_features = df.iloc[i]
+            # We need the RAW features for matching (before encoding was overwritten)
+            # But we overwrote df. Luckily, we can use the original input_df for Rank/Branch
+            # and `df` (before encoding... wait, I overwrote it).
+            # Actually, `extract_features` added `last_role_title` as string.
+            # But the encoding loop overwrote it with int.
+            # I need to re-extract or be careful.
             
+            # Re-get the raw last role title
+            # It's in 'prior_appointments'
+            raw_last_role = 'Unknown'
+            if history and isinstance(history, list):
+                # Use Normalized!
+                raw_last_role = self.dp.normalize_role_title(history[-1]['title'])
+
+            user_cbr_context = {
+                'Rank': user_rank,
+                'Branch': user_branch,
+                'last_role_title': raw_last_role
+            }
+
             for gen_role, gen_prob in zip(top_k_labels, top_k_probs):
-                if gen_prob < 0.01: continue # Skip very low prob
+                if gen_prob < 0.01: continue
 
-                # Get specific billets for this role type
-                specific_billets = self.billet_map.get(gen_role, [])
+                # CASE BASED REASONING LOOKUP
+                specific_billets = self._find_similar_cases(gen_role, user_cbr_context)
 
-                # If no map (shouldn't happen), fallback to gen_role
-                if not specific_billets:
-                    specific_billets = [gen_role]
-
-                # Limit to 3 specific examples per generalized role to avoid flooding
-                # Ideally, we would score specific billets by availability or fit,
-                # but random selection from valid set is a good start for this prototype.
-                import random
-                # Deterministic shuffle for stability
-                random.seed(42 + i)
-                # We can filter specific billets if they have metadata (e.g. strict rank)
-                # but currently the constraints are on the generalized role.
-
-                # Just take up to 3
-                selected_billets = specific_billets[:3]
-
-                for billet in selected_billets:
+                for billet in specific_billets:
                     final_predictions.append(billet)
-                    # We slightly decay confidence for specificity to represent uncertainty?
-                    # No, let's keep the confidence of the parent category.
                     final_confidences.append(gen_prob)
 
-                    # Generate Explanation (based on generalized fit)
                     reasons = []
                     # Rank Progression
                     role_ranks = self.constraints.get(gen_role, {}).get('ranks', [])
@@ -193,18 +225,8 @@ class Predictor:
                             if rid != -1:
                                 avg_role_rank_idx = rid
                                 break
-
-                    if avg_role_rank_idx > user_rank_idx:
-                        reasons.append("Promotion Step")
-                    elif avg_role_rank_idx == user_rank_idx:
-                        reasons.append("Lateral Move")
-
-                    # Training Fit
-                    label_lower = gen_role.lower()
-                    if 'command' in label_lower and row_features.get('count_command_training', 0) > 0:
-                        reasons.append("Command Trained")
-                    if 'engineer' in label_lower and row_features.get('count_engineering_training', 0) > 0:
-                        reasons.append("Engineering Trained")
+                    if avg_role_rank_idx > user_rank_idx: reasons.append("Promotion Step")
+                    elif avg_role_rank_idx == user_rank_idx: reasons.append("Lateral Move")
 
                     final_explanations.append(", ".join(reasons[:2]) or "General Fit")
 
@@ -215,7 +237,7 @@ class Predictor:
                 'Confidence': final_confidences,
                 'Explanation': final_explanations
             })
-            # Sort by confidence again
+            # Sort by confidence
             res = res.sort_values('Confidence', ascending=False).head(5)
             results.append(res)
             
