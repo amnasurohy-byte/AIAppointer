@@ -148,50 +148,68 @@ class Predictor:
         current_rank = officer.get('Rank')
         current_branch = officer.get('Branch')
         
-        # We iterate our VALID ROLES only
-        for role_name in self.valid_roles:
-            # Get metadata from training artifacts if available, else fallback
-            meta = self.role_meta.get(role_name)
-            if not meta:
-                # If role is in JSON but not in Training Data (Cold Start),
-                # construct dummy meta from JSON
-                cons = self.strict_constraints[role_name]
-                meta = {
-                    'Role': role_name,
-                    'Branch': cons.get('branches', ['Unknown'])[0], # Take first
-                    'Pool': 'Unknown', # JSON doesn't have pool usually?
-                    'REQ_Ranks': cons.get('ranks', []),
-                    'freq': 1
-                }
+        # Multi-Pass Candidate Selection
+        # Pass 1: Strict Constraints
+        # Pass 2: Relaxed Constraints (if Strict yields 0) - Ignore Branch/Entry
+        
+        candidates_to_score = []
+        
+        for attempt in ['strict', 'relaxed']:
+            temp_candidates = []
+            if attempt == 'relaxed':
+                 print("  > Strict constraints yielded 0 candidates. Retrying with RELAXED constraints.")
             
-            # Constraints Check
-            if self.strict_constraints:
-                 role_cons = self.strict_constraints.get(role_name, {})
-                 
-                 # Strict Rank Check
-                 ranks = role_cons.get('ranks', [])
-                 if ranks and current_rank not in ranks:
-                     continue
+            for role_name in self.valid_roles:
+                # Meta retrieval
+                meta = self.role_meta.get(role_name)
+                if not meta:
+                    cons = self.strict_constraints.get(role_name, {})
+                    meta = {
+                        'Role': role_name,
+                        'Branch': cons.get('branches', ['Unknown'])[0],
+                        'Pool': 'Unknown',
+                        'REQ_Ranks': cons.get('ranks', []),
+                        'freq': 1
+                    }
+                
+                # Validation Logic
+                if self.strict_constraints:
+                     role_cons = self.strict_constraints.get(role_name, {})
                      
-                 # Strict Branch Check (if we want to enforce it? data might be flexible)
-                 # Let's enforce it if User wants strictness. Default to Yes.
-                 branches = role_cons.get('branches', [])
-                 if branches and current_branch and current_branch not in branches:
-                     continue
-                     
-                 # NEW: Strict Entry Check
-                 entries = role_cons.get('entries', [])
-                 current_entry = context.get('Entry_type')
-                 if entries and current_entry and current_entry not in entries:
-                     continue
+                     # 1. RANK CHECK (Always Enforced, unless we add Pass 3)
+                     ranks = role_cons.get('ranks', [])
+                     if ranks and current_rank not in ranks:
+                         continue
+                         
+                     if attempt == 'strict':
+                        # 2. MATCH CHECK (Branch)
+                        branches = role_cons.get('branches', [])
+                        if branches and current_branch:
+                            # Science Relaxation (Partial)
+                            if current_branch == "Science":
+                                 allowed = ["Science", "Engineering", "Tactical Systems"]
+                                 if not any(b in allowed for b in branches):
+                                     continue
+                            elif current_branch not in branches:
+                                continue
+                        
+                        # 3. ENTRY CHECK
+                        entries = role_cons.get('entries', [])
+                        current_entry = context.get('Entry_type')
+                        if entries and current_entry and current_entry not in entries:
+                            continue
+                
+                # If we got here, it passed
+                if role_name in self.role_meta:
+                    temp_candidates.append(self.role_meta[role_name])
+            
+            # End of Role Loop
+            if temp_candidates:
+                candidates_to_score = temp_candidates
+                break # Found valid candidates
+                
+        # If still empty after relaxed pass, effectively return empty
 
-                 # Strict Pool Check (Maybe?)
-                 # pools = role_cons.get('pools', [])
-                 # Current pool matching is handled by LTR features usually, but strict filter?
-                 # Let's trust LTR for pool unless explicitly requested.
-            
-            if role_name in self.role_meta:
-                candidates_to_score.append(self.role_meta[role_name])
             
         # If strict filter removes everything, relax
         if not candidates_to_score:
@@ -204,22 +222,49 @@ class Predictor:
         if not candidates_to_score:
              return pd.DataFrame([{'Prediction': 'No valid roles found for Rank/Branch/Entry', 'Confidence': 0, 'Explanation': 'Strict Constraints blocked all options.'}])
              
-        # 2. Score Candidates
         X_rows = []
         meta_list = []
+        feats_list = []
         
         for cand in candidates_to_score:
             feats = self.ltr_fe.generate_pair_features(officer, cand, self.transition_stats)
+            
+            # Inject Context for Explainability
+            # Calculate simple Entry Match for display (using strict constraints fallback logic)
+            # We don't have easy access to role_cons here in the loop without looking up again.
+            # But we can pass it if we refactor. For now, let's just pass officer Entry Type.
+            
+            entry_type = officer.get('Entry_type', 'Unknown')
+            # Look up constraint for this role?
+            # We are iterating `candidates_to_score` which came from `valid_roles` loop.
+            # We don't have the constraints handy here in `predict` loop easily.
+            # But LTR feats usually don't use it.
+            # Let's just pass the officer's type. Explainer can display "Candidate is [Type]".
+            
+            feats['_Context'] = {
+                'From_Title': officer.get('last_role_title', 'Unknown'),
+                'To_Title': cand.get('Role', 'Unknown'),
+                'From_Pool': officer.get('Pool', 'Unknown'),
+                'To_Pool': cand.get('Pool', 'Unknown'),
+                'Officer_Training': officer.get('Training_history', ''),
+                'Entry_Type': entry_type
+            }
+            
             # Ensure correct col order
             vector = [feats.get(c, 0) for c in self.feature_cols]
             X_rows.append(vector)
             meta_list.append(cand)
+            feats_list.append(feats)
             
         if not X_rows:
             return pd.DataFrame()
             
         # Batch Predict
-        scores = self.model.predict(X_rows)
+        raw_scores = self.model.predict(X_rows)
+        
+        # Normalize: GBRT scores are unbounded. Map to 0-1 via Sigmoid.
+        # This fixes "Zero Confidence" issues for negative raw scores.
+        scores = 1 / (1 + np.exp(-raw_scores))
         
         # 3. Rank and Format
         scored_candidates = []
@@ -227,7 +272,7 @@ class Predictor:
             scored_candidates.append({
                 'role': meta_list[i]['Role'],
                 'score': score,
-                'feats': X_rows[i] # could use for explanation
+                '_Feats': feats_list[i]
             })
             
         # Sort desc
@@ -251,7 +296,8 @@ class Predictor:
             results.append({
                 'Prediction': role,
                 'Confidence': prob,
-                'Explanation': reason
+                'Explanation': reason,
+                '_Feats': item['_Feats']
             })
             
         return pd.DataFrame(results)
@@ -276,6 +322,7 @@ class Predictor:
         # Taking all for now to show scores
         # Iterate officers
         X_rows = []
+        feats_list = []
         indices = []
         
         # Load constraints for target role
@@ -316,28 +363,51 @@ class Predictor:
             except:
                 pass # Use raw if fails
             feats = self.ltr_fe.generate_pair_features(off_dict, cand_meta, self.transition_stats)
+            
+            # Inject Context for Explainability
+            feats['_Context'] = {
+                'From_Title': off_dict.get('last_role_title', 'Unknown'),
+                'To_Title': cand_meta.get('Role', 'Unknown'),
+                'From_Pool': off_dict.get('Pool', 'Unknown'),
+                'To_Pool': cand_meta.get('Pool', 'Unknown'),
+                'Officer_Training': off_dict.get('Training_history', '')
+            }
+            
+            # Store feats for later retrieval
+            # We can't put Dict in X_rows.
+            # We must map index to feats.
+            # Hack: Store in a temp list aligned with X_rows?
+            # Or simplified: X_rows is list of lists
+            
             vector = [feats.get(c, 0) for c in self.feature_cols]
             
             X_rows.append(vector)
+            feats_list.append(feats) # Needs initialization
             indices.append(idx)
             
         if not X_rows: return pd.DataFrame()
         
-        scores = self.model.predict(X_rows)
+        # Predict Raw Scores
+        raw_scores = self.model.predict(X_rows)
+        
+        # Normalize
+        scores = 1 / (1 + np.exp(-raw_scores))
         
         out = []
         for i, score in enumerate(scores):
             orig_idx = indices[i]
             row = candidates_df.loc[orig_idx]
+            feat_dict = feats_list[i]
             
-            if score > 0.000001: # Low threshold to show something
+            if score > 0.01: # 1% threshold to filter noise
                 out.append({
                     'Employee_ID': row['Employee_ID'],
                     'Name': f"Officer {row['Employee_ID']}",
                     'Rank': row['Rank'],
                     'Branch': row['Branch'],
                     'Confidence': score,
-                    'Explanation': f"Match Probability: {score:.1%}"
+                    'Explanation': f"Match Probability: {score:.1%}",
+                    '_Feats': feat_dict 
                 })
         
         if not out:

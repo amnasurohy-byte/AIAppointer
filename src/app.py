@@ -59,9 +59,22 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+from src.predictor import Predictor
+from src.explainer import Explainer
+# Config already imported at top, verified.
+# st.set_page_config already called at top.
+
+# Cache loaders
+# Cache loaders
 @st.cache_resource(ttl=3600)
-def load_predictor():
+@st.cache_resource
+def load_predictor_v2():
     return Predictor()
+
+@st.cache_resource
+def load_explainer_v3(df, titles=None):
+    return Explainer(df, known_titles=titles)
+
 
 # --- CACHE CLEARING UTILITY ---
 def clear_cache():
@@ -79,8 +92,16 @@ def main():
     
     # Load Resources
     with st.spinner("Loading AI Models..."):
-        predictor = load_predictor()
+        predictor = load_predictor_v2()
         df = load_data()
+        
+        # Extract known titles for fuzzy normalization
+        # Combine historical titles AND valid target roles to ensure full coverage
+        h_titles = list(predictor.transition_stats['title_trans'].keys()) if hasattr(predictor, 'transition_stats') else []
+        t_titles = list(predictor.valid_roles) if hasattr(predictor, 'valid_roles') else []
+        known_titles = list(set(h_titles + t_titles))
+        
+        explainer = load_explainer_v3(df, known_titles)
         
     # Navigation
     mode = st.sidebar.radio("Mode", ["Employee Lookup", "Simulation", "Billet Lookup", "Branch Analytics"])
@@ -178,15 +199,58 @@ def main():
                 else:
                     st.warning(f"Weak Signal ({top_conf:.1%}). Model suggests: **{results.iloc[0]['Prediction']}**")
 
-                st.dataframe(
-                    results.style.format({"Confidence": "{:.1%}"})
-                           .background_gradient(subset=["Confidence"], cmap="Greens"),
-                    use_container_width=True,
-                    column_config={
-                        "Prediction": st.column_config.TextColumn("Role", width="medium"),
-                        "Explanation": st.column_config.TextColumn("Reasoning", width="large")
-                    }
-                )
+                st.subheader(f"Top 10 Recommendations")
+                
+                # Interactive List with Explainability
+                # Logic mirrors Billet Lookup
+                
+                for idx, r_row in results.head(10).iterrows():
+                    score = r_row['Confidence']
+                    score_color = "🟢" if score > 0.5 else "🟡" if score > 0.1 else "⚪"
+                    role_name = r_row['role'] if 'role' in r_row else r_row['Prediction']
+                    
+                    with st.expander(f"{score_color} {score:.1%} | {role_name}"):
+                         # 1. Breakdown Chart
+                        st.markdown("#### 📊 Why this recommendation?")
+                        feats = r_row.get('_Feats', {})
+                        if feats:
+                            metrics = explainer.format_feature_explanation(feats, score=top_conf, constraints=predictor.constraints)
+                            # Create comparison chart
+                            c1, c2, c3, c4, c5 = st.columns(5)
+                            
+                            m_ai = metrics.get('AI Score', {'value': '0%', 'desc': 'No Data'})
+                            c1.metric("AI Score", m_ai['value'], help=m_ai['desc'])
+                            
+                            m_hist = metrics.get('History Strength', {'value': '0%', 'desc': 'No Data'})
+                            c2.metric("History Match", m_hist['value'], help=m_hist['desc'])
+                            
+                            m_train = metrics.get('Training Match', {'value': '-', 'desc': 'No Data'})
+                            c3.metric("Training", m_train['value'], help=m_train['desc'])
+                            
+                            m_bp = metrics.get('Branch & Pool Fit', {'value': '-', 'desc': 'No Data'})
+                            c4.metric("Branch & Pool", m_bp['value'], help=m_bp['desc'])
+                            
+                            m_re = metrics.get('Rank & Entry Fit', {'value': '-', 'desc': 'No Data'})
+                            c5.metric("Rank & Entry", m_re['value'], help=m_re['desc'])
+                            
+                        # 2. Historical Precedents
+                        st.markdown("#### 📜 Historical Precedents")
+                        
+                        # Use exact title from Predictor context (matches Tooltip)
+                        ctx = feats.get('_Context', {})
+                        context_title = ctx.get('From_Title')
+                        
+                        # Fallback to row if context missing
+                        curr_title = context_title if context_title else row.get('current_appointment', row.get('last_role_title'))
+                        
+                        if curr_title:
+                            precedents = explainer.get_precedents(curr_title, role_name)
+                            if precedents:
+                                st.write(f"Officers who moved from **{curr_title}** to **{role_name}**:")
+                                cols = ['Employee_ID', 'Rank', 'Name', 'Branch', 'Pool', 'Entry_type', 'Appointment_history', 'Training_history']
+                                st.dataframe(pd.DataFrame(precedents)[cols], hide_index=True)
+                            else:
+                                st.caption("No exact historical precedents found for this specific transition.")
                 
             except Exception as e:
                 st.error(f"Prediction unavailable: {e}")
@@ -289,7 +353,7 @@ def main():
               ))])
               
             fig.update_layout(title_text="Workforce Flow: Entry -> Rank -> Branch -> Pool", font_size=10, height=600)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig)
             
     elif mode == "Simulation":
         st.header("🎮 Career Simulation Playground")
@@ -424,22 +488,64 @@ def main():
                         # Limit to top 20
                         match_df = match_df.head(20)
                         
-                        st.success(f"Found {len(match_df)} recommended candidates.")
-                        st.dataframe(
-                            match_df.style.format({"Confidence": "{:.1%}"})
-                                    .background_gradient(subset=["Confidence"], cmap="Greens"),
-                            width="stretch",
-                            column_config={
-                                "Employee_ID": st.column_config.NumberColumn("Employee ID", format="%d"),
-                                "Name": st.column_config.TextColumn("Name", width="medium"),
-                                "Rank": st.column_config.TextColumn("Rank", width="small"),
-                                "Branch": st.column_config.TextColumn("Branch", width="medium"),
-                                "Current_Role": st.column_config.TextColumn("Current Role", width="medium"),
-                                "Explanation": st.column_config.TextColumn("Reasoning", width="large")
-                            }
-                        )
-                    else:
-                        st.warning("No suitable candidates found for this role.")
+                        st.subheader(f"Top Recommended Candidates ({len(match_df)})")
+                        
+                        # Interactive List with Explainability
+                        for idx, row in match_df.iterrows():
+                            # Header with Score
+                            score = row['Confidence']
+                            score_color = "🟢" if score > 0.5 else "🟡" if score > 0.1 else "⚪"
+                            
+                            with st.expander(f"{score_color} {score:.1%} | {row['Rank']} {row['Name']} ({row['Branch']})"):
+                                # 1. Breakdown Chart
+                                st.markdown("#### 📊 Why this recommendation?")
+                                feats = row.get('_Feats', {})
+                                if feats:
+                                    metrics = explainer.format_feature_explanation(feats, score=score, constraints=predictor.constraints)
+                                    # Create comparison chart
+                                    c1, c2, c3, c4, c5 = st.columns(5)
+                                    
+                                    m_ai = metrics.get('AI Score', {'value': '0%', 'desc': 'No Data'})
+                                    c1.metric("AI Score", m_ai['value'], help=m_ai['desc'])
+                                    
+                                    m_hist = metrics.get('History Strength', {'value': '0%', 'desc': 'No Data'})
+                                    c2.metric("History Match", m_hist['value'], help=m_hist['desc'])
+                                    
+                                    m_train = metrics.get('Training Match', {'value': '-', 'desc': 'No Data'})
+                                    c3.metric("Training", m_train['value'], help=m_train['desc'])
+                                    
+                                    m_bp = metrics.get('Branch & Pool Fit', {'value': '-', 'desc': 'No Data'})
+                                    c4.metric("Branch & Pool", m_bp['value'], help=m_bp['desc'])
+                                    
+                                    m_re = metrics.get('Rank & Entry Fit', {'value': '-', 'desc': 'No Data'})
+                                    c5.metric("Rank & Entry", m_re['value'], help=m_re['desc'])
+                                
+                                # 2. Historical Precedents
+                                st.markdown("#### 📜 Historical Precedents")
+                                
+                                # Use exact title from Predictor context (matches Tooltip)
+                                ctx = feats.get('_Context', {})
+                                curr_clean = ctx.get('From_Title')
+                                
+                                # Semantic fallback if needed
+                                if not curr_clean:
+                                    emp_id = row['Employee_ID']
+                                    cand_record = df[df['Employee_ID'] == emp_id]
+                                    if not cand_record.empty:
+                                         hist = cand_record.iloc[0]['Appointment_history']
+                                         if isinstance(hist, str):
+                                            curr = hist.split(',')[0]
+                                            curr_clean = re.sub(r'\s*\(.*?\)', '', curr).strip()
+                                
+                                if curr_clean:
+                                    precedents = explainer.get_precedents(curr_clean, target_role)
+                                    if precedents:
+                                        st.write(f"Officers who moved from **{curr_clean}** to **{target_role}**:")
+                                        cols = ['Employee_ID', 'Rank', 'Name', 'Branch', 'Pool', 'Entry_type', 'Appointment_history', 'Training_history']
+                                        st.dataframe(pd.DataFrame(precedents)[cols], hide_index=True)
+                                    else:
+                                        st.caption("No exact historical precedents found.")
 
 if __name__ == "__main__":
     main()
+                                
