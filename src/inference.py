@@ -14,7 +14,7 @@ class Predictor:
         print(f"Loading models from {models_dir}...")
         self.role_model = joblib.load(os.path.join(models_dir, 'role_model.pkl'))
         self.unit_model = joblib.load(os.path.join(models_dir, 'unit_model.pkl'))
-        self.seq_model = joblib.load(os.path.join(models_dir, 'seq_model.pkl')) # NEW
+        self.seq_model = joblib.load(os.path.join(models_dir, 'seq_model.pkl'))
 
         self.encoders = joblib.load(os.path.join(models_dir, 'feature_encoders.pkl'))
         self.role_encoder = joblib.load(os.path.join(models_dir, 'role_encoder.pkl'))
@@ -29,7 +29,7 @@ class Predictor:
         else:
              self.constraints = {}
 
-        # Load Knowledge Base for CBR
+        # Load Knowledge Base
         kb_path = os.path.join(models_dir, 'knowledge_base.csv')
         if os.path.exists(kb_path):
             self.kb_df = pd.read_csv(kb_path)
@@ -40,13 +40,21 @@ class Predictor:
         self.dp = DataProcessor()
         self.fe = FeatureEngineer()
         
-    def predict(self, input_df, rank_flex_up=0, rank_flex_down=0):
+    def predict(self, input_df, rank_flex_up=0, rank_flex_down=0, return_debug=False):
+        """
+        Predicts next specific appointment via Dual-Model + CBR process.
+        Args:
+            input_df: DataFrame with officer profiles.
+            rank_flex_up: Int, ranks to allow upward.
+            rank_flex_down: Int, ranks to allow downward.
+            return_debug: Bool, if True returns (results_list, debug_info_list).
+        """
         # 1. Processing
         df = input_df.copy()
         df = self.dp.get_current_features(df)
         df = self.fe.extract_features(df)
         
-        # 2. Encoding - DYNAMIC
+        # 2. Encoding
         current_ranks = input_df['Rank'].tolist()
         current_branches = input_df['Branch'].tolist()
         
@@ -71,6 +79,8 @@ class Predictor:
         lgbm_unit_probas = self.unit_model.predict_proba(X)
 
         results = []
+        debug_infos = [] # Store debug info per row
+
         all_roles = self.role_encoder.classes_
         all_units = self.unit_encoder.classes_
         
@@ -78,11 +88,11 @@ class Predictor:
         rank_map = {r: i for i, r in enumerate(rank_order)}
         
         for i in range(len(X)):
+            row_debug = {}
+
             # --- ENSEMBLE: LightGBM + Markov Chain ---
             # Get Current State
             last_role_title = 'Unknown'
-            # We can get last role title from FeatureEngineer output before encoding
-            # Or re-extract from history
             hist = df.iloc[i]['prior_appointments']
             if hist and isinstance(hist, list):
                 last_role_title = hist[-1].get('normalized_title', 'Unknown')
@@ -92,22 +102,50 @@ class Predictor:
                 last_role_title = 'Recruit'
                 last_unit = 'Unknown'
 
+            row_debug['last_role'] = last_role_title
+            row_debug['last_unit'] = last_unit
+
             # Get Sequential Probabilities
             seq_role_probs = self.seq_model.predict_role_probs(last_role_title, all_roles)
             seq_unit_probs = self.seq_model.predict_unit_probs(last_unit, all_units)
 
             # Combine Role Probs
-            # Weighted Ensemble: 0.7 LGBM + 0.3 Seq
-            combined_role_probs = lgbm_role_probas[i].copy()
+            lgbm_r = lgbm_role_probas[i]
+            combined_role_probs = lgbm_r.copy()
             for r_idx, role_label in enumerate(all_roles):
                 p_seq = seq_role_probs.get(role_label, 0.0)
-                combined_role_probs[r_idx] = (combined_role_probs[r_idx] * 0.7) + (p_seq * 0.3)
+                combined_role_probs[r_idx] = (lgbm_r[r_idx] * 0.7) + (p_seq * 0.3)
 
             # Combine Unit Probs
-            combined_unit_probs = lgbm_unit_probas[i].copy()
+            lgbm_u = lgbm_unit_probas[i]
+            combined_unit_probs = lgbm_u.copy()
             for u_idx, unit_label in enumerate(all_units):
                 p_seq = seq_unit_probs.get(unit_label, 0.0)
-                combined_unit_probs[u_idx] = (combined_unit_probs[u_idx] * 0.7) + (p_seq * 0.3)
+                combined_unit_probs[u_idx] = (lgbm_u[u_idx] * 0.7) + (p_seq * 0.3)
+
+            # Debug: Capture Top 3 BEFORE constraints
+            if return_debug:
+                top_3_r_idx = np.argsort(combined_role_probs)[-3:][::-1]
+                row_debug['top_roles_raw'] = []
+                for idx in top_3_r_idx:
+                    lbl = all_roles[idx]
+                    row_debug['top_roles_raw'].append({
+                        'role': lbl,
+                        'lgbm': lgbm_r[idx],
+                        'seq': seq_role_probs.get(lbl, 0.0),
+                        'combined': combined_role_probs[idx]
+                    })
+
+                top_3_u_idx = np.argsort(combined_unit_probs)[-3:][::-1]
+                row_debug['top_units_raw'] = []
+                for idx in top_3_u_idx:
+                    lbl = all_units[idx]
+                    row_debug['top_units_raw'].append({
+                        'unit': lbl,
+                        'lgbm': lgbm_u[idx],
+                        'seq': seq_unit_probs.get(lbl, 0.0),
+                        'combined': combined_unit_probs[idx]
+                    })
 
             # Normalize
             if combined_role_probs.sum() > 0: combined_role_probs /= combined_role_probs.sum()
@@ -122,7 +160,10 @@ class Predictor:
             if hist and isinstance(hist, list):
                 past_titles = {self.dp.normalize_role_title(h['title']) for h in hist}
             
+            constrained_roles = []
+
             for c_idx, role_name in enumerate(all_roles):
+                status = "Allowed"
                 if role_name in self.constraints:
                     const = self.constraints[role_name]
                     # Rank
@@ -141,14 +182,24 @@ class Predictor:
                                      break
                              else:
                                  if abs(rank_diff) <= rank_flex_down: rank_match = True; break
-                    if not rank_match: combined_role_probs[c_idx] = 0.0; continue
+                    if not rank_match:
+                        combined_role_probs[c_idx] = 0.0
+                        status = "Rank Mismatch"
 
                     # Branch
                     allowed_branches = const.get('branches', [])
                     if allowed_branches and user_branch not in allowed_branches:
-                             combined_role_probs[c_idx] = 0.0; continue
+                             combined_role_probs[c_idx] = 0.0
+                             status = "Branch Mismatch"
 
                 if role_name in past_titles: combined_role_probs[c_idx] *= 0.1
+
+                # Debug info for filtered
+                # Only store if it WAS high probability
+                if return_debug and lgbm_r[c_idx] > 0.1 and status != "Allowed":
+                    constrained_roles.append(f"{role_name} ({status})")
+
+            row_debug['constraints_applied'] = constrained_roles
 
             # Normalize again
             if combined_role_probs.sum() > 0: combined_role_probs /= combined_role_probs.sum()
@@ -164,7 +215,6 @@ class Predictor:
                 p_role = combined_role_probs[r_idx]
                 if p_role < 0.01: continue
 
-                # Get KB candidates for this role
                 if role_name in self.kb_by_role.groups:
                     kb_subset = self.kb_by_role.get_group(role_name)
                     unique_raws = kb_subset['Target_Next_Role_Raw'].unique()
@@ -174,6 +224,8 @@ class Predictor:
                         p_unit = 0.001
 
                         # Find p_unit in combined_unit_probs
+                        # Optimization: map unit string to index first?
+                        # Scanning top_k_u is fast enough for 5 items
                         for u_idx in top_k_u:
                             if all_units[u_idx] == unit_of_raw:
                                 p_unit = combined_unit_probs[u_idx]
@@ -200,7 +252,10 @@ class Predictor:
                 res = pd.DataFrame({'Rank Info': [1], 'Prediction': ['Unknown'], 'Confidence': [0.0], 'Explanation': ['No Match']})
 
             results.append(res)
+            debug_infos.append(row_debug)
             
+        if return_debug:
+            return results, debug_infos
         return results[0] if len(results) == 1 else results
 
     def predict_for_role(self, input_df, target_role, rank_flex_up=0, rank_flex_down=0):
